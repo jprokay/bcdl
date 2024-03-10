@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"time"
@@ -36,13 +35,17 @@ func NewUser(username, identity string) *User {
 }
 
 // NewDownloader creates a new Download object using the specified options.
-func NewDownloader(user *User, dirPath string, options ...func(*Downloader)) *Downloader {
+func NewDownloader(user *User, dirPath string, options ...func(*Downloader)) (*Downloader, error) {
+	if dirPath == "" {
+		return nil, fmt.Errorf("Directory path cannot be empty")
+	}
+
 	dl := &Downloader{user: user, dirPath: dirPath}
 
 	for _, f := range options {
 		f(dl)
 	}
-	return dl
+	return dl, nil
 }
 
 // WithContext sets the context for the downloader.
@@ -80,7 +83,7 @@ func WithFiletype(filetype FileType) func(*Downloader) {
 //   - context: Background
 //   - timeout: 3 minutes
 //   - filetype: MP3_320
-func DefaultDownloader(user *User, dirPath string) *Downloader {
+func DefaultDownloader(user *User, dirPath string) (*Downloader, error) {
 	return NewDownloader(user, dirPath,
 		WithContext(context.Background()),
 		WithTimeout(3*time.Minute),
@@ -111,8 +114,10 @@ func (j *downloadJob) succeeded() {
 }
 
 // workers will pull jobs off of the jobs channel and send the results to the results channel.
+// TODO: Add in exponential backoff for retries. Helpful for longer downloads
 func worker(id int, jobs <-chan downloadJob, results chan<- downloadJob, browserCtx AuthorizedBandcampContext) {
 	for job := range jobs {
+		// TODO: Set this to use the job timeoutMs
 		jobCtx, cancel := context.WithTimeout(context.Background(), time.Minute*4)
 		jobErr := make(chan error, 1)
 		go func() {
@@ -140,11 +145,11 @@ func worker(id int, jobs <-chan downloadJob, results chan<- downloadJob, browser
 func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
 	page, err := browserCtx.NewCollectionEntryPage(job.Entry)
 
-	defer page.Close()
-
 	if err != nil {
 		return fmt.Errorf("Could not create page: %w", err)
 	}
+
+	defer page.Close()
 
 	_, err = page.Goto()
 
@@ -153,7 +158,11 @@ func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
 	}
 
 	// Download the specific format
-	page.SelectFileType(job.filetype)
+	err = page.SelectFileType(job.filetype)
+
+	if err != nil {
+		return fmt.Errorf("Could not select file type %s: %w", job.filetype, err)
+	}
 
 	// Download the page
 	var timeout float64 = job.timeoutMs
@@ -184,9 +193,8 @@ type DownloadOpts struct {
 // In addition to the zip files, the method creates a hidden .bcdl folder to track
 // files to make the tool more useful.
 func (d *Downloader) Download(opts DownloadOpts) error {
-	wd := d.dirPath
-	outDir := filepath.Join(wd, "out")
-	bcdlDir := filepath.Join(wd, "out", "bcdl")
+	outDir := d.dirPath
+	bcdlDir := filepath.Join(outDir, ".bcdl")
 
 	// Downloads will go here
 	if err := os.Mkdir(outDir, 0o777); err != nil && !os.IsExist(err) {
@@ -199,10 +207,11 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 	}
 
 	// Create an append only file
-	file, err := os.OpenFile(filepath.Join(wd, "out", ".bcdl", "downloaded"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	// TODO: Add history tracking so we repeatedly run and skip downloads
+	// file, err := os.OpenFile(filepath.Join(wd, "out", ".bcdl", "downloaded"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 
 	// Install browsers & run
-	err = playwright.Install()
+	err := playwright.Install()
 	if err != nil {
 		return fmt.Errorf("Could not install playwright: %v", err)
 	}
@@ -219,6 +228,11 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 	}
 
 	context, err := NewAuthorizedBandcampContext(browser, d.user.identity)
+
+	if err != nil {
+		return fmt.Errorf("could not create context: %v", err)
+	}
+
 	page, err := context.NewCollectionPage(d.user.username)
 
 	if err != nil {
@@ -246,11 +260,6 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 		go worker(w, jobs, results, context)
 	}
 
-	// Shuffle things up
-	rand.Shuffle(len(entries), func(i, j int) {
-		entries[i], entries[j] = entries[j], entries[i]
-	})
-
 	// Get the album name and every download link
 	for _, entry := range entries {
 		opts.OnStart(entry.title)
@@ -259,15 +268,15 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 			Entry:       entry,
 			DownloadDir: outDir,
 			filetype:    d.filetype,
-			timeoutMs:   240_000,
+
+			// TODO: Make configurable!
+			timeoutMs: 240_000,
 		}
 	}
 
 	for i := 0; i < len(entries); i++ {
 		job := <-results
 		if job.Success {
-			// Write to the history file
-			file.WriteString(fmt.Sprintf("%s\n", job.Entry.title))
 			opts.OnSuccess(job.Entry.title)
 		} else {
 			opts.OnFailure(job.Entry.title)

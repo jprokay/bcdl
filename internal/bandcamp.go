@@ -137,7 +137,11 @@ func (cp CollectionPage) Close() error {
 func (cp CollectionPage) filter(filter string) error {
 	input := cp.page.Locator("div#collection-search > input.search-box")
 
-	input.Fill(filter)
+	err := input.Fill(filter)
+
+	if err != nil {
+		return err
+	}
 
 	// Don't wait too long for the results ot return.
 	timeout := 10_000.0
@@ -155,7 +159,12 @@ func (cp CollectionPage) filter(filter string) error {
 // are malformed and skipped. The resulting entry set will only contain entries that
 // were successfully parsed.
 func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error) {
-	cp.filter(filter)
+	err := cp.filter(filter)
+
+	if err != nil {
+		return []CollectionEntry{}, fmt.Errorf("Failed to filter albums %w", err)
+	}
+
 	moreToShow, err := cp.page.Locator("div#collection-items > div.expand-container").IsHidden()
 
 	var albumCount int = 0
@@ -178,7 +187,10 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 			albumCount = converted
 		}
 
-		loc.Click()
+		err = loc.Click()
+		if err != nil {
+			return []CollectionEntry{}, fmt.Errorf("Could not click button to load more albums: %w", err)
+		}
 	}
 
 	// BC seems to load in increments of 20 at the default window size for Playwright.
@@ -193,18 +205,27 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 	respUrl := bcUrl.JoinPath("api", "fancollection", "1", "collection_items")
 	// Perform scrolling and wait for the API to return the results
 	for i := 0; i < scrollTimes; i++ {
-		cp.page.Mouse().Wheel(0, 10_000)
+		err := cp.page.Mouse().Wheel(0, 10_000)
 
-		cp.page.ExpectResponse(respUrl.String(), func() error { return nil })
+		if err != nil {
+			log.Printf("Error when scrolling. Continuing...")
+			continue
+		}
+
+		_, err = cp.page.ExpectResponse(respUrl.String(), func() error { return nil })
+
+		if err != nil {
+			log.Printf("Error waiting for response to scroll. Continuing...")
+		}
 	}
 
 	var entries []playwright.Locator
 
 	// Have to use a different process for gettng entries depending on if the list is filtered
 	if filter == "" {
-		entries, err = cp.page.Locator(".collection-item-container").All()
+		entries, _ = cp.page.Locator(".collection-item-container").All()
 	} else {
-		entries, err = cp.page.Locator("div#collection-search-items li.collection-item-container").All()
+		entries, _ = cp.page.Locator("div#collection-search-items li.collection-item-container").All()
 	}
 
 	collectionEntries := make([]CollectionEntry, 0, cap(entries))
