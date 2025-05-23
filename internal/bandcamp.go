@@ -54,10 +54,16 @@ func NewAuthorizedBandcampContext(browser playwright.Browser, identity string) (
 		Cookies: cookies,
 	}
 
-	// Set up the storage state and context
+	// Set up the storage state and context with realistic browser parameters
 	ctx, err := browser.NewContext(playwright.BrowserNewContextOptions{
-		UserAgent:    playwright.String("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"),
-		StorageState: &oss,
+		UserAgent:      playwright.String("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"),
+		Viewport:       &playwright.ViewportSize{Width: 1920, Height: 1080},
+		DeviceScaleFactor: playwright.Float(1.0),
+		HasTouch:       playwright.Bool(false),
+		JavaScriptEnabled: playwright.Bool(true),
+		TimezoneId:     playwright.String("America/New_York"),
+		Locale:         playwright.String("en-US"),
+		StorageState:   &oss,
 	})
 
 	if err != nil {
