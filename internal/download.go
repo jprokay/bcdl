@@ -269,6 +269,12 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 		return fmt.Errorf("could not goto: %v", err)
 	}
 
+	cookiesVisible, err := page.AcceptCookiesModal().IsVisible()
+
+	if cookiesVisible {
+		page.AcceptCookiesModal().Click(playwright.LocatorClickOptions{})
+	}
+
 	err = page.filter(opts.Filter)
 	count, err := page.AlbumCount()
 	log.Printf("Downloading %v albums", count)
@@ -338,7 +344,12 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 		close(results)
 		log.Printf("%d/%d completed. Scrolling.", i, scrollTimes)
 		history.writeOut()
-		page.ScrollPage()
+
+		page.page.Reload()
+
+		for range i {
+			page.ScrollPage()
+		}
 	}
 
 	history.writeOut()

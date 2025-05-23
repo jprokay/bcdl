@@ -56,14 +56,14 @@ func NewAuthorizedBandcampContext(browser playwright.Browser, identity string) (
 
 	// Set up the storage state and context with realistic browser parameters
 	ctx, err := browser.NewContext(playwright.BrowserNewContextOptions{
-		UserAgent:      playwright.String("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"),
-		Viewport:       &playwright.ViewportSize{Width: 1920, Height: 1080},
+		UserAgent:         playwright.String("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"),
+		Viewport:          &playwright.Size{Width: 1920, Height: 1080},
 		DeviceScaleFactor: playwright.Float(1.0),
-		HasTouch:       playwright.Bool(false),
+		HasTouch:          playwright.Bool(false),
 		JavaScriptEnabled: playwright.Bool(true),
-		TimezoneId:     playwright.String("America/New_York"),
-		Locale:         playwright.String("en-US"),
-		StorageState:   &oss,
+		TimezoneId:        playwright.String("America/New_York"),
+		Locale:            playwright.String("en-US"),
+		StorageState:      &oss,
 	})
 
 	if err != nil {
@@ -164,6 +164,10 @@ func (cp CollectionPage) HasMore() (bool, error) {
 
 func (cp CollectionPage) ShowMoreButton() playwright.Locator {
 	return cp.page.Locator("div#collection-items > div.expand-container > button.show-more")
+}
+
+func (cp CollectionPage) AcceptCookiesModal() playwright.Locator {
+	return cp.page.GetByRole(*playwright.AriaRoleButton, playwright.PageGetByRoleOptions{Name: "Accept All"})
 }
 
 func (cp CollectionPage) Entries(filter string) ([]CollectionEntry, error) {
