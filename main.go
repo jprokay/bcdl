@@ -2,28 +2,54 @@ package main
 
 import (
 	"bcdl/internal"
-	"bcdl/internal/tui"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 )
 
-func main() {
-	selected, err := tui.Run()
+type FileTypeFlag struct {
+	value internal.FileType
+}
 
-	if err != nil {
-		log.Fatalf("Halting execution %v", err)
-		os.Exit(1)
+func (ftf *FileTypeFlag) Set(s string) error {
+	for _, ft := range internal.AllFileTypes {
+		if s == string(ft) {
+			ftf.value = ft
+			return nil
+		}
 	}
+	return fmt.Errorf("%s is not in list of valid filetypes %s", s, internal.AllFileTypes)
+}
 
-	user := internal.NewUser(selected.Username, selected.Identity)
-	dl, err := internal.DefaultDownloader(user, selected.Directory)
+func (ftf *FileTypeFlag) String() string {
+	return string(ftf.value)
+}
+
+func main() {
+	//selected, err := tui.Run()
+
+	var username = flag.String("username", "", "Bandcamp username")
+	var identity = flag.String("password", "", "Identity")
+	var fileType = FileTypeFlag{
+		value: internal.MP3_320,
+	}
+	var directory = flag.String("outpath", "", "Path to save files")
+	var filter = flag.String("filter", "", "Filter criteria")
+	flag.Var(&fileType, "filetype", "File type to download")
+
+	flag.Parse()
+
+	log.Printf(fileType.String())
+	user := internal.NewUser(*username, *identity)
+	dl, err := internal.DefaultDownloader(user, *directory)
 
 	if err != nil {
 		log.Fatalf("Directory not set")
-		os.Exit(1)
 	}
 
-	internal.WithFiletype(selected.FileType)(dl)
+	log.Printf("File type: %s", fileType.value)
+	internal.WithFiletype(fileType.value)(dl)
 
 	opts := internal.DownloadOpts{
 		OnStart: func(name string) {
@@ -33,10 +59,9 @@ func main() {
 			log.Printf("Successfully downloaded: %s\n", name)
 		},
 		OnFailure: func(name string) {
-
 			log.Printf("Failed to download: %s\n", name)
 		},
-		Filter: selected.Filter,
+		Filter: *filter,
 	}
 
 	results := make(chan error)

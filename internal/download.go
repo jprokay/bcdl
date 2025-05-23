@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -98,7 +99,8 @@ type downloadJob struct {
 	Success     bool
 	DownloadDir string
 	filetype    FileType
-	timeoutMs   float64
+	timeout     time.Duration
+	retries     int8
 }
 
 // failed marks the job as failed and sets the error
@@ -113,12 +115,25 @@ func (j *downloadJob) succeeded() {
 	j.err = nil
 }
 
+const MAX_RETRIES = 5
+
+func (j *downloadJob) timedOut() (err error) {
+	if j.retries == MAX_RETRIES {
+		return fmt.Errorf("Reached maximum allowed retries")
+	}
+	j.Success = false
+	j.err = fmt.Errorf("Timed out after %f minutes", j.timeout.Minutes())
+	j.retries++
+	// Instead of an exponential backoff, add two minutes each time we retry
+	j.timeout += time.Duration(2 * time.Minute)
+	return nil
+}
+
 // workers will pull jobs off of the jobs channel and send the results to the results channel.
-// TODO: Add in exponential backoff for retries. Helpful for longer downloads
-func worker(id int, jobs <-chan downloadJob, results chan<- downloadJob, browserCtx AuthorizedBandcampContext) {
+func worker(id int, jobs chan downloadJob, results chan<- downloadJob, browserCtx AuthorizedBandcampContext) {
 	for job := range jobs {
-		// TODO: Set this to use the job timeoutMs
-		jobCtx, cancel := context.WithTimeout(context.Background(), time.Minute*4)
+		log.Printf("Starting job: %s", job.Entry.title)
+		jobCtx, cancel := context.WithTimeout(context.Background(), job.timeout)
 		jobErr := make(chan error, 1)
 		go func() {
 			jobErr <- processJob(job, browserCtx)
@@ -127,8 +142,16 @@ func worker(id int, jobs <-chan downloadJob, results chan<- downloadJob, browser
 
 		select {
 		case <-jobCtx.Done():
-			job.failed(fmt.Errorf("%s timed out", job.Entry.title))
-			results <- job
+			err := job.timedOut()
+
+			if err != nil {
+				// Max retries. Fail the job
+				job.failed(err)
+				results <- job
+			} else {
+				// Push it back into the queue for processing
+				jobs <- job
+			}
 		case err := <-jobErr:
 			if err != nil {
 				job.failed(err)
@@ -165,7 +188,7 @@ func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
 	}
 
 	// Download the page
-	var timeout float64 = job.timeoutMs
+	var timeout float64 = float64(job.timeout.Milliseconds())
 
 	err = page.DownloadFile(job.DownloadDir, timeout)
 
@@ -206,12 +229,14 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 		return fmt.Errorf("Could not create output dir %v", err)
 	}
 
-	// Create an append only file
-	// TODO: Add history tracking so we repeatedly run and skip downloads
-	// file, err := os.OpenFile(filepath.Join(wd, "out", ".bcdl", "downloaded"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	history, err := NewHistory(filepath.Join(bcdlDir, "downloaded"))
+
+	if err != nil {
+		return fmt.Errorf("Failure to get history file %v", err)
+	}
 
 	// Install browsers & run
-	err := playwright.Install()
+	err = playwright.Install()
 	if err != nil {
 		return fmt.Errorf("Could not install playwright: %v", err)
 	}
@@ -244,47 +269,79 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 		return fmt.Errorf("could not goto: %v", err)
 	}
 
-	// Get all entries in the collection
-	entries, err := page.GetCollection(opts.Filter)
+	err = page.filter(opts.Filter)
+	count, err := page.AlbumCount()
+	log.Printf("Downloading %v albums", count)
+	scrollTimes, err := page.ScrollTimes()
+	log.Printf("Need to scroll %v times", scrollTimes)
 
-	if err != nil {
-		return fmt.Errorf("Could not get your collection. Check that you have the correct identity cookie value")
-	}
+	// 0. Get first page of entries
+	// 1. Enqueue jobs
+	// 2. Scroll if there are more
+	// 3. Enqueue next set of jobs
+	// 4. Ensure no duplicates - should be able to use in memory history
+	// 5. continue until done
 
-	// Set up jobs
-	jobs := make(chan downloadJob, len(entries))
-	results := make(chan downloadJob, len(entries))
+	for i := range scrollTimes {
+		entries, err := page.Entries(opts.Filter)
 
-	// Limit jobs to 3. This seems to be the sweet spot
-	for w := 0; w < 3; w++ {
-		go worker(w, jobs, results, context)
-	}
-
-	// Get the album name and every download link
-	for _, entry := range entries {
-		opts.OnStart(entry.title)
-		// Enqueue those jobs
-		jobs <- downloadJob{
-			Entry:       entry,
-			DownloadDir: outDir,
-			filetype:    d.filetype,
-
-			// TODO: Make configurable!
-			timeoutMs: 240_000,
+		if err != nil {
+			return fmt.Errorf("Could not get your collection. Err: %v\nCheck that you have the correct identity cookie value", err)
 		}
-	}
 
-	for i := 0; i < len(entries); i++ {
-		job := <-results
-		if job.Success {
-			opts.OnSuccess(job.Entry.title)
-		} else {
-			opts.OnFailure(job.Entry.title)
+		notDownloaded := make([]CollectionEntry, 0, len(entries))
+		// Get the album name and every download link
+		for _, entry := range entries {
+
+			// Skip any previously downloaded files
+			if history.containsDownload(entry.title, d.filetype) {
+				log.Printf("Already downloaded %s. Skipping", entry.title)
+				continue
+			}
+
+			notDownloaded = append(notDownloaded, entry)
+
 		}
+		// Set up jobs
+		jobs := make(chan downloadJob, len(notDownloaded))
+		results := make(chan downloadJob, len(notDownloaded))
+
+		// Limit jobs to 3. This seems to be the sweet spot
+		for w := 0; w < 3; w++ {
+			go worker(w, jobs, results, context)
+		}
+
+		for _, entry := range notDownloaded {
+			opts.OnStart(entry.title)
+			// Enqueue those jobs
+			jobs <- downloadJob{
+				Entry:       entry,
+				DownloadDir: outDir,
+				filetype:    d.filetype,
+				timeout:     time.Duration(time.Minute * 4),
+			}
+
+		}
+
+		for range notDownloaded {
+			job := <-results
+			if job.Success {
+				history.addItem(job.Entry.title, d.filetype)
+				opts.OnSuccess(job.Entry.title)
+			} else {
+				log.Printf("Error: %v", job.err)
+				opts.OnFailure(job.Entry.title)
+			}
+		}
+
+		close(jobs)
+		close(results)
+		log.Printf("%d/%d completed. Scrolling.", i, scrollTimes)
+		history.writeOut()
+		page.ScrollPage()
 	}
 
-	close(jobs)
-	close(results)
+	history.writeOut()
 
 	if err = browser.Close(); err != nil {
 		return fmt.Errorf("could not close browser: %v", err)

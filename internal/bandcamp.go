@@ -28,7 +28,7 @@ var bcUrl = url.URL{
 
 // NewAuthorizedBandcampContext setups an NewAuthorizedBandcampContext.
 //
-// It takes in two parameters: an instance of a playwright.Browswer and an identity string.
+// It takes in two parameters: an instance of a playwright.Browser and an identity string.
 // The identity string must be the value from the "identity" cookie stored in a User's browser
 // after successful authentication.
 //
@@ -135,6 +135,10 @@ func (cp CollectionPage) Close() error {
 //
 // The filter parameter, if empty, will set the search box to blank.
 func (cp CollectionPage) filter(filter string) error {
+	if len(filter) <= 0 {
+		return nil
+	}
+
 	input := cp.page.Locator("div#collection-search > input.search-box")
 
 	err := input.Fill(filter)
@@ -143,9 +147,125 @@ func (cp CollectionPage) filter(filter string) error {
 		return err
 	}
 
-	// Don't wait too long for the results ot return.
-	timeout := 10_000.0
+	// Don't wait too long for the results to return.
+	timeout := 1_000.0
 	return cp.page.Locator("div#collection-search.searched").WaitFor(playwright.LocatorWaitForOptions{Timeout: &timeout})
+}
+
+func (cp CollectionPage) HasMore() (bool, error) {
+	return cp.ShowMoreButton().IsVisible()
+}
+
+func (cp CollectionPage) ShowMoreButton() playwright.Locator {
+	return cp.page.Locator("div#collection-items > div.expand-container > button.show-more")
+}
+
+func (cp CollectionPage) Entries(filter string) ([]CollectionEntry, error) {
+	var entries []playwright.Locator
+	var error error
+	// Have to use a different process for getting entries depending on if the list is filtered
+	if filter == "" {
+		entries, error = cp.page.Locator(".collection-item-container").All()
+	} else {
+		entries, error = cp.page.Locator("div#collection-search-items li.collection-item-container").All()
+	}
+
+	if error != nil {
+		return []CollectionEntry{}, error
+	}
+
+	collectionEntries := make([]CollectionEntry, 0, cap(entries))
+
+	for _, entry := range entries {
+		title, err := entry.Locator("div.collection-title-details > a > div.collection-item-title").InnerText()
+		if err != nil || title == "" {
+			continue
+		}
+
+		href, err := entry.Locator("span.redownload-item a").GetAttribute("href")
+		if err != nil || href == "" {
+			continue
+		}
+
+		url, err := url.Parse(href)
+
+		if err != nil || url.String() == "" {
+			continue
+		}
+
+		ce := CollectionEntry{
+			url:   *url,
+			title: title,
+		}
+
+		collectionEntries = append(collectionEntries, ce)
+	}
+
+	return collectionEntries, nil
+}
+
+func (cp CollectionPage) ScrollPage() {
+	loc := cp.ShowMoreButton()
+
+	visible, _ := loc.IsVisible()
+
+	if visible {
+		loc.Click()
+		return
+	}
+
+	respUrl := bcUrl.JoinPath("api", "fancollection", "1", "collection_items")
+	err := cp.page.Mouse().Wheel(0, 10_000)
+
+	if err != nil {
+		log.Printf("Tried to scroll. At bottom?: %v", err)
+	}
+
+	_, err = cp.page.ExpectResponse(respUrl.String(), func() error { return nil })
+
+	if err != nil {
+		log.Printf("No response received from scroll. At bottom?: %v", err)
+	}
+}
+
+func (cp CollectionPage) ScrollTimes() (int, error) {
+
+	albumCount, err := cp.AlbumCount()
+
+	if err != nil {
+		return 0, err
+	}
+
+	return int(math.Ceil(float64(albumCount) / 20.0)), nil
+}
+
+func (cp CollectionPage) AlbumCount() (int, error) {
+	button := cp.ShowMoreButton()
+
+	visible, _ := button.IsVisible()
+
+	albumCount := 0
+
+	if visible {
+		albums, err := button.TextContent()
+
+		if err != nil {
+			log.Printf("No more to load. Continuing... %v", err)
+		}
+
+		// Get the count of how many more albums there are to grab
+		var re = regexp.MustCompile(`\b\d+\b`)
+		converted, err := strconv.Atoi(re.FindString(albums))
+
+		if err == nil {
+			albumCount = converted
+		}
+
+	} else {
+		albumCount = 20
+	}
+
+	return albumCount, nil
 }
 
 // GetCollection returns all items on the collection page.
@@ -165,7 +285,7 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 		return []CollectionEntry{}, fmt.Errorf("Failed to filter albums %w", err)
 	}
 
-	moreToShow, err := cp.page.Locator("div#collection-items > div.expand-container").IsHidden()
+	moreToShow, err := cp.page.Locator("div#collection-items > div.expand-container").IsVisible()
 
 	var albumCount int = 0
 
@@ -221,7 +341,7 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 
 	var entries []playwright.Locator
 
-	// Have to use a different process for gettng entries depending on if the list is filtered
+	// Have to use a different process for getting entries depending on if the list is filtered
 	if filter == "" {
 		entries, _ = cp.page.Locator(".collection-item-container").All()
 	} else {
@@ -297,10 +417,13 @@ func (cep CollectionEntryPage) Goto() (playwright.Response, error) {
 func (cep CollectionEntryPage) SelectFileType(ft FileType) error {
 
 	value := []string{string(ft)}
+	//selector := fmt.Sprintf("option[value=\"%s\"]", ft)
+	//cep.page.Locator(selector).WaitFor(playwright.LocatorWaitForOptions{})
+
 	_, err := cep.page.Locator("select#format-type").SelectOption(playwright.SelectOptionValues{Values: &value})
 
 	if err != nil {
-		return fmt.Errorf("Error when selection option %s: %w", ft, err)
+		return fmt.Errorf("Error when selecting option %s: %w", ft, err)
 	}
 
 	return nil
