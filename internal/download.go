@@ -101,6 +101,7 @@ type downloadJob struct {
 	filetype    FileType
 	timeout     time.Duration
 	retries     int8
+	logger      *ContextLogger
 }
 
 // failed marks the job as failed and sets the error
@@ -166,9 +167,15 @@ func worker(id int, jobs chan downloadJob, results chan<- downloadJob, browserCt
 
 // processJob does the heavy lifting of going to the URL for an album and managing the download process.
 func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
+	if job.logger == nil {
+		job.logger = NewContextLogger(fmt.Sprintf("Job: %s", job.Entry.title))
+	}
+	job.logger.Printf("Starting download process")
+	
 	page, err := browserCtx.NewCollectionEntryPage(job.Entry)
 
 	if err != nil {
+		job.logger.Printf("Failed to create page: %v", err)
 		return fmt.Errorf("Could not create page: %w", err)
 	}
 
@@ -177,8 +184,11 @@ func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
 	_, err = page.Goto()
 
 	if err != nil {
+		job.logger.Printf("Failed to navigate to album page: %v", err)
 		return fmt.Errorf("Could not goto %s: %w", job.Entry.url.String(), err)
 	}
+
+	job.logger.Printf("Successfully loaded album page")
 
 	// Download the specific format
 	err = page.SelectFileType(job.filetype)
@@ -189,6 +199,7 @@ func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
 
 	// Download the page
 	var timeout float64 = float64(job.timeout.Milliseconds())
+	job.logger.Printf("Initiating download with timeout of %.1f seconds", timeout/1000)
 
 	err = page.DownloadFile(job.DownloadDir, timeout)
 
@@ -196,6 +207,7 @@ func processJob(job downloadJob, browserCtx AuthorizedBandcampContext) error {
 		return fmt.Errorf("Could not download file: %w", err)
 	}
 
+	job.logger.Printf("Download completed successfully")
 	return nil
 }
 
@@ -325,6 +337,7 @@ func (d *Downloader) Download(opts DownloadOpts) error {
 				DownloadDir: outDir,
 				filetype:    d.filetype,
 				timeout:     time.Duration(time.Minute * 4),
+				logger:      NewContextLogger(fmt.Sprintf("Job: %s", entry.title)),
 			}
 
 		}

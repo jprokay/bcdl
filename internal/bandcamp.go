@@ -391,23 +391,31 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 
 // CollectionEntryPage represents a specific album.
 type CollectionEntryPage struct {
-	page  playwright.Page
-	entry CollectionEntry
+	page   playwright.Page
+	entry  CollectionEntry
+	logger *ContextLogger
 }
 
 func newCollectionEntryPage(page playwright.Page, entry CollectionEntry) CollectionEntryPage {
-
+	logger := NewContextLogger(fmt.Sprintf("Album: %s", entry.title))
+	
 	return CollectionEntryPage{
-		page:  page,
-		entry: entry,
+		page:   page,
+		entry:  entry,
+		logger: logger,
 	}
 }
 
 // Goto navigates to the page for the Collection Entry
 func (cep CollectionEntryPage) Goto() (playwright.Response, error) {
-	return cep.page.Goto(cep.entry.url.String(), playwright.PageGotoOptions{
+	cep.logger.Printf("Navigating to album page")
+	resp, err := cep.page.Goto(cep.entry.url.String(), playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateNetworkidle,
 	})
+	if err != nil {
+		cep.logger.Printf("Failed to navigate: %v", err)
+	}
+	return resp, err
 }
 
 // SelectFileType selects the specified file type and waits for it to be ready to download.
@@ -425,7 +433,7 @@ func (cep CollectionEntryPage) Goto() (playwright.Response, error) {
 // MP3_V0 produces the smallest files and the quickest downloads. Formats like FLAC will
 // require generous allowances for timeouts as they can be large and take a while to prepare
 func (cep CollectionEntryPage) SelectFileType(ft FileType) error {
-
+	cep.logger.Printf("Selecting file type: %s", ft)
 	value := []string{string(ft)}
 	//selector := fmt.Sprintf("option[value=\"%s\"]", ft)
 	//cep.page.Locator(selector).WaitFor(playwright.LocatorWaitForOptions{})
@@ -433,9 +441,11 @@ func (cep CollectionEntryPage) SelectFileType(ft FileType) error {
 	_, err := cep.page.Locator("select#format-type").SelectOption(playwright.SelectOptionValues{Values: &value})
 
 	if err != nil {
+		cep.logger.Printf("Error selecting format %s: %v", ft, err)
 		return fmt.Errorf("Error when selecting option %s: %w", ft, err)
 	}
-
+	
+	cep.logger.Printf("Successfully selected file type: %s", ft)
 	return nil
 }
 
@@ -446,6 +456,7 @@ func (cep CollectionEntryPage) SelectFileType(ft FileType) error {
 // Depending on the file type, it can take longer for the download to hit the Prepared
 // state
 func (cep CollectionEntryPage) DownloadFile(outputDir string, timeoutMs float64) error {
+	cep.logger.Printf("Starting download (timeout: %.1f seconds)", timeoutMs/1000)
 	dl, err := cep.page.ExpectDownload(func() error {
 		return cep.page.Locator(`.download-button + a`).Click()
 	}, playwright.PageExpectDownloadOptions{
@@ -453,17 +464,22 @@ func (cep CollectionEntryPage) DownloadFile(outputDir string, timeoutMs float64)
 	})
 
 	if err != nil {
+		cep.logger.Printf("Download failed: %v", err)
 		return fmt.Errorf("Could not start download: %w", err)
 	}
 
 	// Download the file and save using the browser suggested name
 	path := filepath.Join(outputDir, dl.SuggestedFilename())
+	cep.logger.Printf("Downloading to: %s", path)
+	
 	err = dl.SaveAs(path)
 
 	if err != nil {
+		cep.logger.Printf("Failed to save file: %v", err)
 		return fmt.Errorf("Could not download file: %w", err)
 	}
 
+	cep.logger.Printf("Download completed successfully")
 	return nil
 }
 
