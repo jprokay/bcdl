@@ -3,6 +3,7 @@ package internal
 import (
 	"bufio"
 	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 type historyFile struct {
 	file *os.File
+	path string
 }
 
 type History struct {
@@ -19,16 +21,17 @@ type History struct {
 
 func newHistoryFile(path string) (*historyFile, error) {
 
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return &historyFile{file: file}, nil
+	return &historyFile{file: file, path: path}, nil
 }
 
 func (h *historyFile) readHistory() *History {
+	_, _ = h.file.Seek(0, io.SeekStart)
 	s := bufio.NewScanner(h.file)
 	items := make(map[string]bool)
 
@@ -72,7 +75,7 @@ func md5Download(title string, ft FileType) string {
 		panic(err)
 	}
 
-	return string(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (h *History) addItem(title string, ft FileType) {
@@ -81,7 +84,14 @@ func (h *History) addItem(title string, ft FileType) {
 }
 
 func (h *History) writeOut() {
-	w := bufio.NewWriter(h.file.file)
+	file, err := os.OpenFile(h.file.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		fmt.Printf("failed to open history file for writing %v", err)
+		return
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
 
 	defer func(w *bufio.Writer) {
 		err := w.Flush()

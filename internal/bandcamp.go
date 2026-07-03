@@ -1,13 +1,17 @@
 package internal
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
@@ -19,6 +23,22 @@ import (
 type AuthorizedBandcampContext struct {
 	ctx      playwright.BrowserContext
 	identity string
+}
+
+type exportedCookie struct {
+	Name       string  `json:"name"`
+	Value      string  `json:"value"`
+	Domain     string  `json:"domain"`
+	Host       string  `json:"host"`
+	Path       string  `json:"path"`
+	Expires    float64 `json:"expires"`
+	Expiration float64 `json:"expirationDate"`
+	HttpOnly   bool    `json:"httpOnly"`
+	Secure     bool    `json:"secure"`
+	NameRaw    string  `json:"Name raw"`
+	ContentRaw string  `json:"Content raw"`
+	HostRaw    string  `json:"Host raw"`
+	PathRaw    string  `json:"Path raw"`
 }
 
 var bcUrl = url.URL{
@@ -34,22 +54,12 @@ var bcUrl = url.URL{
 //
 // Playwright has some issues running into captcha challenges during the login procedure, so this
 // method is the most full proof, if a bit annoying.
-func NewAuthorizedBandcampContext(browser playwright.Browser, identity string) (AuthorizedBandcampContext, error) {
-	// Cookie to handle login
-	// Would be great to get rid of this and do a login flow to get the value
-	cookie := playwright.Cookie{
-		Name:     "identity",
-		Value:    identity,
-		Domain:   bcUrl.Host,
-		Path:     "/",
-		Secure:   true,
-		HttpOnly: true,
-		Expires:  float64(time.Now().Add(180 * 24 * time.Hour).Unix()),
+func NewAuthorizedBandcampContext(browser playwright.Browser, identity string, cookiesFile string) (AuthorizedBandcampContext, error) {
+	cookies, err := loadCookies(identity, cookiesFile)
+	if err != nil {
+		return AuthorizedBandcampContext{}, err
 	}
 
-	var cookies []playwright.OptionalCookie
-
-	cookies = append(cookies, cookie.ToOptionalCookie())
 	oss := playwright.OptionalStorageState{
 		Cookies: cookies,
 	}
@@ -71,6 +81,161 @@ func NewAuthorizedBandcampContext(browser playwright.Browser, identity string) (
 	}
 
 	return AuthorizedBandcampContext{ctx: ctx, identity: identity}, nil
+}
+
+func loadCookies(identity string, cookiesFile string) ([]playwright.OptionalCookie, error) {
+	if cookiesFile != "" {
+		cookies, err := loadCookiesFile(cookiesFile)
+		if err != nil {
+			return nil, err
+		}
+		if identity != "" {
+			cookies = append(cookies, identityCookie(identity).ToOptionalCookie())
+		}
+		return cookies, nil
+	}
+
+	if identity == "" {
+		return nil, fmt.Errorf("either identity or cookies file must be provided")
+	}
+
+	return []playwright.OptionalCookie{identityCookie(identity).ToOptionalCookie()}, nil
+}
+
+func identityCookie(identity string) playwright.Cookie {
+	return playwright.Cookie{
+		Name:     "identity",
+		Value:    identity,
+		Domain:   bcUrl.Host,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		Expires:  float64(time.Now().Add(180 * 24 * time.Hour).Unix()),
+	}
+}
+
+func loadCookiesFile(path string) ([]playwright.OptionalCookie, error) {
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		return loadJSONCookies(path)
+	}
+
+	return loadNetscapeCookies(path)
+}
+
+func loadJSONCookies(path string) ([]playwright.OptionalCookie, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read cookies file: %w", err)
+	}
+
+	var exported []exportedCookie
+	if err := json.Unmarshal(data, &exported); err != nil {
+		return nil, fmt.Errorf("could not parse JSON cookies file: %w", err)
+	}
+
+	cookies := make([]playwright.OptionalCookie, 0, len(exported))
+	for _, c := range exported {
+		name := firstNonEmpty(c.Name, c.NameRaw)
+		value := firstNonEmpty(c.Value, c.ContentRaw)
+		domain := normalizeCookieDomain(firstNonEmpty(c.Domain, c.Host, c.HostRaw))
+		cookiePath := firstNonEmpty(c.Path, c.PathRaw, "/")
+		expires := c.Expires
+		if expires == 0 {
+			expires = c.Expiration
+		}
+
+		if name == "" || value == "" || domain == "" || !strings.Contains(domain, "bandcamp.com") {
+			continue
+		}
+
+		cookies = append(cookies, playwright.Cookie{
+			Name:     name,
+			Value:    value,
+			Domain:   domain,
+			Path:     cookiePath,
+			Secure:   c.Secure,
+			HttpOnly: c.HttpOnly,
+			Expires:  expires,
+		}.ToOptionalCookie())
+	}
+
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("no bandcamp.com cookies found in %s", path)
+	}
+
+	log.Printf("Loaded %d Bandcamp cookies from %s", len(cookies), path)
+	return cookies, nil
+}
+
+func loadNetscapeCookies(path string) ([]playwright.OptionalCookie, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read cookies file: %w", err)
+	}
+	defer file.Close()
+
+	var cookies []playwright.OptionalCookie
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Split(line, "\t")
+		if len(parts) != 7 {
+			continue
+		}
+
+		domain := normalizeCookieDomain(parts[0])
+		if !strings.Contains(domain, "bandcamp.com") {
+			continue
+		}
+
+		expires, _ := strconv.ParseFloat(parts[4], 64)
+		cookies = append(cookies, playwright.Cookie{
+			Name:    parts[5],
+			Value:   parts[6],
+			Domain:  domain,
+			Path:    firstNonEmpty(parts[2], "/"),
+			Secure:  strings.EqualFold(parts[3], "TRUE"),
+			Expires: expires,
+		}.ToOptionalCookie())
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("could not scan cookies file: %w", err)
+	}
+
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("no bandcamp.com cookies found in %s", path)
+	}
+
+	log.Printf("Loaded %d Bandcamp cookies from %s", len(cookies), path)
+	return cookies, nil
+}
+
+func normalizeCookieDomain(domain string) string {
+	domain = strings.TrimSpace(domain)
+	domain = strings.TrimPrefix(domain, "http://")
+	domain = strings.TrimPrefix(domain, "https://")
+	domain = strings.TrimSuffix(domain, "/")
+	if domain == "bandcamp.com" {
+		return domain
+	}
+	if strings.HasSuffix(domain, ".bandcamp.com") {
+		return domain
+	}
+	return domain
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // NewCollectionPage creates a Page Object that represents the user's collection of albums,
@@ -110,6 +275,7 @@ type CollectionPage struct {
 type CollectionEntry struct {
 	url   url.URL
 	title string
+	id    string
 }
 
 // NewCollectionPage creates a Page Object that represents the user's collection of albums.
@@ -125,9 +291,15 @@ func newCollectionPage(page playwright.Page, username string) CollectionPage {
 
 // Goto executes the Playwright Goto method to the collection URL.
 func (cp CollectionPage) Goto() (playwright.Response, error) {
-	return cp.page.Goto(cp.url.String(), playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	resp, err := cp.page.Goto(cp.url.String(), playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 	})
+	if err != nil {
+		return resp, err
+	}
+	timeout := 30_000.0
+	err = cp.page.Locator(".collection-item-container, div#collection-search").First().WaitFor(playwright.LocatorWaitForOptions{Timeout: &timeout})
+	return resp, err
 }
 
 // Close wraps the Playwright page.Close() method.
@@ -206,6 +378,7 @@ func (cp CollectionPage) Entries(filter string) ([]CollectionEntry, error) {
 		ce := CollectionEntry{
 			url:   *url,
 			title: title,
+			id:    collectionEntryID(*url, title),
 		}
 
 		collectionEntries = append(collectionEntries, ce)
@@ -380,6 +553,7 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 		ce := CollectionEntry{
 			url:   *url,
 			title: title,
+			id:    collectionEntryID(*url, title),
 		}
 
 		collectionEntries = append(collectionEntries, ce)
@@ -387,6 +561,114 @@ func (cp CollectionPage) GetCollection(filter string) ([]CollectionEntry, error)
 	}
 
 	return collectionEntries, nil
+}
+
+func collectionEntryID(entryURL url.URL, fallback string) string {
+	for _, value := range entryURL.Query() {
+		for _, part := range value {
+			if id := saleItemID(part); id != "" {
+				return id
+			}
+		}
+	}
+
+	if id := saleItemID(entryURL.String()); id != "" {
+		return id
+	}
+
+	return fallback
+}
+
+func saleItemID(value string) string {
+	re := regexp.MustCompile(`\b[prct]\d+\b`)
+	return re.FindString(value)
+}
+
+type DownloadEntriesOpts struct {
+	OutDir string
+	Filter string
+}
+
+func (page CollectionPage) DownloadEntries(scrollTo int, outDir string, history *History, fileType FileType, context AuthorizedBandcampContext, workers int, limit int, delayMin time.Duration, delayMax time.Duration, opts DownloadOpts) error {
+	err := page.filter(opts.Filter)
+	if err != nil {
+		return fmt.Errorf("could not filter collection: %w", err)
+	}
+	// 0. Get first page of entries
+	// 1. Enqueue jobs
+	// 2. Scroll if there are more
+	// 3. Enqueue next set of jobs
+	// 4. Ensure no duplicates - should be able to use in memory history
+	// 5. continue until done
+
+	for range scrollTo {
+		page.ScrollPage()
+	}
+	entries, err := page.Entries(opts.Filter)
+
+	if err != nil {
+		return fmt.Errorf("Could not get your collection. Err: %v\nCheck that you have the correct identity cookie value", err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("found collection items but no redownload links; exported cookies are probably not authenticated. Provide the identity cookie with -password or re-export cookies from a logged-in browser")
+	}
+
+	notDownloaded := make([]CollectionEntry, 0, len(entries))
+	// Get the album name and every download link
+	for _, entry := range entries {
+		log.Printf("Starting job for %s", entry.title)
+		// Skip any previously downloaded files
+		if history.containsDownload(entry.id, fileType) {
+			log.Printf("Already downloaded %s. Skipping", entry.title)
+			continue
+		}
+
+		notDownloaded = append(notDownloaded, entry)
+		if limit > 0 && len(notDownloaded) >= limit {
+			break
+		}
+
+	}
+	// Set up jobs
+	jobs := make(chan downloadJob, len(notDownloaded))
+	results := make(chan downloadJob, len(notDownloaded))
+
+	if workers <= 0 {
+		workers = 1
+	}
+	for w := 0; w < workers; w++ {
+		go worker(w, jobs, results, context, delayMin, delayMax)
+	}
+
+	for _, entry := range notDownloaded {
+		opts.OnStart(entry.title)
+		// Enqueue those jobs
+		jobs <- downloadJob{
+			Entry:       entry,
+			DownloadDir: outDir,
+			filetype:    fileType,
+			timeout:     time.Duration(time.Minute * 4),
+			logger:      NewContextLogger(fmt.Sprintf("Job: %s", entry.title)),
+		}
+
+	}
+
+	for range notDownloaded {
+		job := <-results
+		if job.Success {
+			history.addItem(job.Entry.id, fileType)
+			opts.OnSuccess(job.Entry.title)
+		} else {
+			log.Printf("Error: %v", job.err)
+			opts.OnFailure(job.Entry.title)
+		}
+	}
+
+	close(jobs)
+	close(results)
+	history.writeOut()
+
+	return nil
 }
 
 // CollectionEntryPage represents a specific album.
@@ -398,7 +680,7 @@ type CollectionEntryPage struct {
 
 func newCollectionEntryPage(page playwright.Page, entry CollectionEntry) CollectionEntryPage {
 	logger := NewContextLogger(fmt.Sprintf("Album: %s", entry.title))
-	
+
 	return CollectionEntryPage{
 		page:   page,
 		entry:  entry,
@@ -410,12 +692,26 @@ func newCollectionEntryPage(page playwright.Page, entry CollectionEntry) Collect
 func (cep CollectionEntryPage) Goto() (playwright.Response, error) {
 	cep.logger.Printf("Navigating to album page")
 	resp, err := cep.page.Goto(cep.entry.url.String(), playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateNetworkidle,
+		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 	})
 	if err != nil {
 		cep.logger.Printf("Failed to navigate: %v", err)
+		return resp, err
 	}
+	timeout := 30_000.0
+	err = cep.page.Locator("select#format-type, input.reauth-email").First().WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateAttached,
+		Timeout: &timeout,
+	})
 	return resp, err
+}
+
+func (cp CollectionEntryPage) ReauthInput() playwright.Locator {
+	return cp.page.Locator("input.reauth-email")
+}
+
+func (cp CollectionEntryPage) SubmitReauthFormButton() playwright.Locator {
+	return cp.page.GetByRole(*playwright.AriaRoleButton, playwright.PageGetByRoleOptions{Name: "GO"})
 }
 
 // SelectFileType selects the specified file type and waits for it to be ready to download.
@@ -444,8 +740,46 @@ func (cep CollectionEntryPage) SelectFileType(ft FileType) error {
 		cep.logger.Printf("Error selecting format %s: %v", ft, err)
 		return fmt.Errorf("Error when selecting option %s: %w", ft, err)
 	}
-	
+
 	cep.logger.Printf("Successfully selected file type: %s", ft)
+	return nil
+}
+
+func (cep CollectionEntryPage) MustReauth() (bool, error) {
+
+	cep.logger.Printf("Checking for reauth...")
+	return cep.ReauthInput().IsVisible()
+}
+
+func (cep CollectionEntryPage) WaitForManualReauth(timeout time.Duration) error {
+	cep.logger.Printf("Reauth requested. Complete the prompt in the browser window.")
+	timeoutMs := float64(timeout.Milliseconds())
+	return cep.ReauthInput().WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateHidden,
+		Timeout: &timeoutMs,
+	})
+}
+
+func (cep CollectionEntryPage) HandleReauth(email string) error {
+	reauthVisible, _ := cep.MustReauth()
+
+	if reauthVisible {
+		// TODO: Get the user email from inputs!
+		err := cep.ReauthInput().Fill("jprokay@gmail.com")
+		if err != nil {
+
+			cep.logger.Printf("Could not fill in reauth input: %v", err)
+			return fmt.Errorf("Could not reauth: %w", err)
+		}
+
+		err = cep.SubmitReauthFormButton().Click()
+		if err != nil {
+
+			cep.logger.Printf("Could not submit reauth form: %v", err)
+			return fmt.Errorf("Could not reauth: %w", err)
+		}
+
+	}
 	return nil
 }
 
@@ -471,7 +805,7 @@ func (cep CollectionEntryPage) DownloadFile(outputDir string, timeoutMs float64)
 	// Download the file and save using the browser suggested name
 	path := filepath.Join(outputDir, dl.SuggestedFilename())
 	cep.logger.Printf("Downloading to: %s", path)
-	
+
 	err = dl.SaveAs(path)
 
 	if err != nil {

@@ -36,3 +36,5 @@ devenv.local.nix
 .pre-commit-config.yaml
 
 tmp
+.aider*
+secrets/
